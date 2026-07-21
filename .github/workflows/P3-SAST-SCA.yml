@@ -1,0 +1,77 @@
+# ── P3-SAST-SCA ───────────────────────────────────────────────────────────
+# Maturity level 3: SAST plus software composition analysis (dependencies).
+# Gates remain advisory.
+name: P3-SAST-SCA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+env:
+  # SCA is performed with Grype, run as a pinned container.
+  #
+  # Rationale: aquasecurity/trivy-action was compromised in March 2026 (a
+  # credential stealer was injected via imposter commits; tags 0.0.1-0.34.2
+  # were affected and subsequently withdrawn). Grype is unaffected, and
+  # invoking it as a pinned container image means no third-party Action code
+  # executes with access to this workflow's token.
+  GRYPE_IMAGE: anchore/grype:v0.104.4
+
+jobs:
+  build-and-scan:
+    name: Build, SAST and SCA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Build
+        run: npm run build --if-present
+        continue-on-error: true
+
+      - name: Prepare reports directory
+        run: mkdir -p reports
+
+      # --- SAST ------------------------------------------------------------
+      - name: Semgrep (SAST)
+        run: |
+          python3 -m pip install --quiet semgrep
+          semgrep scan \
+            --config=p/owasp-top-ten \
+            --config=p/javascript \
+            --config=p/typescript \
+            --sarif --output reports/semgrep.sarif \
+            --metrics=off || true
+
+      # --- SCA -------------------------------------------------------------
+      - name: npm audit (SCA)
+        run: npm audit --json > reports/npm-audit.json || true
+
+      - name: Grype filesystem scan (SCA)
+        run: |
+          docker run --rm -v "$PWD:/src:ro" "$GRYPE_IMAGE" \
+            dir:/src -o json > reports/grype-fs.json 2>/dev/null || \
+            echo '{"matches":[]}' > reports/grype-fs.json
+
+      - name: Finding counts
+        run: |
+          echo "Semgrep:   $(jq '[.runs[].results[]] | length' reports/semgrep.sarif)"
+          echo "npm audit: $(jq '.vulnerabilities // {} | length' reports/npm-audit.json)"
+          echo "Grype fs:  $(jq '.matches | length' reports/grype-fs.json)"
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: P3-SAST-SCA-reports
+          path: reports/
+          retention-days: 30

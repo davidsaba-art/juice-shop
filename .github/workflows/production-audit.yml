@@ -1,0 +1,139 @@
+# ── PRODUCTION AUDIT ──────────────────────────────────────────────────────
+# The ground-truth measurement. Runs the deepest available scan against the
+# built artefact regardless of which pipeline configuration produced it.
+# Anything this audit finds that the pipeline did NOT find pre-deployment is,
+# by the study's definition, an escaped vulnerability.
+#
+# Run this once per configuration, passing the matching pipeline_id, so the
+# artifact is named <PIPELINE_ID>-production-audit.
+#
+# Run it from the Actions tab: "Run workflow" -> pick the pipeline_id.
+name: PRODUCTION-AUDIT
+
+on:
+  workflow_dispatch:
+    inputs:
+      pipeline_id:
+        description: 'Which configuration is being audited'
+        required: true
+        type: choice
+        options:
+          - P1-BASELINE
+          - P2-SAST
+          - P3-SAST-SCA
+          - P4-SAST-SCA-SECRETS
+          - P5-SAST-SCA-SECRETS-DAST
+          - P6-FULL
+
+permissions:
+  contents: read
+
+env:
+  # See P3 for why Grype replaced the Trivy action here.
+  GRYPE_IMAGE: anchore/grype:v0.104.4
+
+jobs:
+  audit:
+    name: Full production audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Prepare directories
+        run: mkdir -p reports zap-wrk && chmod 777 zap-wrk
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      # --- Deep static sweep, every ruleset, no severity floor --------------
+      - name: Semgrep (exhaustive)
+        run: |
+          python3 -m pip install --quiet semgrep
+          semgrep scan \
+            --config=auto \
+            --config=p/owasp-top-ten \
+            --config=p/javascript \
+            --config=p/typescript \
+            --config=p/nodejs \
+            --config=p/security-audit \
+            --config=p/secrets \
+            --sarif --output reports/audit-semgrep.sarif \
+            --metrics=off || true
+
+      - name: npm audit (all severities)
+        run: npm audit --json > reports/audit-npm.json || true
+
+      - name: Grype filesystem (all severities)
+        run: |
+          docker run --rm -v "$PWD:/src:ro" "$GRYPE_IMAGE" \
+            dir:/src -o json > reports/audit-grype-fs.json 2>/dev/null || \
+            echo '{"matches":[]}' > reports/audit-grype-fs.json
+
+      - name: Gitleaks (full history)
+        run: |
+          curl -sSL -o gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks detect --source . \
+            --report-format sarif --report-path reports/audit-gitleaks.sarif \
+            --exit-code 0 --redact
+
+      # --- Deployed artefact ------------------------------------------------
+      - name: Build and start the application
+        run: |
+          docker build -t juice-shop-audit:prod .
+          docker run -d --name app -p 3000:3000 juice-shop-audit:prod
+          for i in $(seq 1 90); do
+            curl -sf http://localhost:3000 > /dev/null && { echo "up after ${i}s"; break; }
+            sleep 1
+          done
+          curl -sf http://localhost:3000 > /dev/null || {
+            echo "App failed to start"; docker logs app; exit 1; }
+
+      - name: Grype image (all severities)
+        run: |
+          docker save juice-shop-audit:prod -o image.tar
+          docker run --rm -v "$PWD:/w:ro" "$GRYPE_IMAGE" \
+            docker-archive:/w/image.tar -o json > reports/audit-grype-image.json 2>/dev/null || \
+            echo '{"matches":[]}' > reports/audit-grype-image.json
+          rm -f image.tar
+
+      - name: ZAP full scan (deep, active)
+        run: |
+          docker run --rm --network host \
+            -v "$(pwd)/zap-wrk:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py \
+              -t http://localhost:3000 \
+              -J audit-zap-full.json \
+              -m 15 \
+              -I || true
+          cp zap-wrk/audit-zap-full.json reports/ 2>/dev/null || \
+            echo '{"site":[]}' > reports/audit-zap-full.json
+
+      - name: Stop the application
+        if: always()
+        run: docker rm -f app || true
+
+      - name: Audit tally
+        run: |
+          echo "Semgrep:     $(jq '[.runs[].results[]] | length' reports/audit-semgrep.sarif)"
+          echo "npm audit:   $(jq '.vulnerabilities // {} | length' reports/audit-npm.json)"
+          echo "Grype fs:    $(jq '.matches | length' reports/audit-grype-fs.json)"
+          echo "Grype image: $(jq '.matches | length' reports/audit-grype-image.json)"
+          echo "Gitleaks:    $(jq '[.runs[].results[]] | length' reports/audit-gitleaks.sarif)"
+          echo "ZAP:         $(jq '[.site[]?.alerts[]?] | length' reports/audit-zap-full.json)"
+
+      - name: Upload audit reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.pipeline_id }}-production-audit
+          path: reports/
+          retention-days: 30

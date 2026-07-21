@@ -1,0 +1,47 @@
+# ── P1-BASELINE ───────────────────────────────────────────────────────────
+# Maturity level 1: build and functional tests only. No security tooling.
+# This is the control condition -- every vulnerability that exists reaches
+# production, so P1's VER establishes the ceiling for the study.
+name: P1-BASELINE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Build
+        run: npm run build --if-present
+        continue-on-error: true
+
+      # No security gates at this maturity level. An empty report directory is
+      # still uploaded so that parse_reports.py sees a valid (zero-finding)
+      # pre-deployment phase rather than a missing one.
+      - name: Create empty report directory
+        run: |
+          mkdir -p reports
+          echo '{"runs":[{"tool":{"driver":{"name":"none"}},"results":[]}]}' \
+            > reports/no-scanning.sarif
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: P1-BASELINE-reports
+          path: reports/
+          retention-days: 30
